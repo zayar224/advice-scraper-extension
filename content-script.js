@@ -459,35 +459,121 @@ function extractDescriptionBullets(){
 }
 
 function extractSpecificationsTable(){
-  // Specs are usually in a <table> with rows of <th>/<td>, OR a div with class containing spec/feature.
   const rows=[];
-  // Table-based.
+  const seenKeys=new Set();
+
+  function addRow(key,value){
+    if(!key||!value||key===value||key.length>120||value.length>2000)return;
+    const normKey=key.toLowerCase().trim();
+    if(seenKeys.has(normKey))return;
+    seenKeys.add(normKey);
+    rows.push({key:key.trim(),value:value.trim()});
+  }
+
+  // 1. Table-based (th/td)
   document.querySelectorAll('table tr').forEach(tr=>{
-    const ths=tr.querySelectorAll('th, td');
-    if(ths.length>=2){
-      const k=safeTextOf(ths[0]);
-      const v=safeTextOf(ths[ths.length-1]);
-      if(k&&v&&k!==v&&k.length<80&&v.length<1000)rows.push({key:k,value:v});
+    const cells=tr.querySelectorAll('th, td');
+    if(cells.length>=2){
+      addRow(safeTextOf(cells[0]),safeTextOf(cells[cells.length-1]));
     }
   });
-  // Div-based key/value (label + value siblings).
-  if(rows.length<3){
-    document.querySelectorAll('[class*="spec"] tr, [class*="Spec"] tr, [class*="feature"] tr, [class*="Feature"] tr').forEach(tr=>{
-      const ths=tr.querySelectorAll('th, td, div');
-      if(ths.length>=2){
-        const k=safeTextOf(ths[0]);
-        const v=safeTextOf(ths[ths.length-1]);
-        if(k&&v&&k!==v&&k.length<80&&v.length<1000)rows.push({key:k,value:v});
+
+  // 2. Definition lists (dl/dt/dd)
+  document.querySelectorAll('dl').forEach(dl=>{
+    const dts=dl.querySelectorAll('dt');
+    const dds=dl.querySelectorAll('dd');
+    dts.forEach((dt,i)=>{
+      addRow(safeTextOf(dt),safeTextOf(dds[i]||''));
+    });
+  });
+
+  // 3. Div/span label-value pairs in spec/feature/detail containers
+  const specContainers=document.querySelectorAll('[class*="spec"],[class*="Spec"],[class*="feature"],[class*="Feature"],[class*="detail"],[class*="Detail"],[class*="attribute"],[class*="Attribute"],[class*="property"],[class*="Property"]');
+  specContainers.forEach(container=>{
+    // Pattern: label + value as siblings
+    const labels=container.querySelectorAll('[class*="label"],[class*="Label"],[class*="name"],[class*="Name"],[class*="key"],[class*="Key"],[class*="title"],[class*="Title"],dt,th');
+    labels.forEach(label=>{
+      const key=safeTextOf(label);
+      let value='';
+      // Next sibling
+      let next=label.nextElementSibling;
+      while(next&&!value){
+        value=safeTextOf(next);
+        next=next.nextElementSibling;
+      }
+      // Or parent's last child
+      if(!value&&label.parentElement){
+        value=safeTextOf(label.parentElement.lastElementChild);
+      }
+      addRow(key,value);
+    });
+
+    // Pattern: rows with two children (key, value)
+    container.querySelectorAll('[class*="row"],[class*="Row"],[class*="item"],[class*="Item"],div,tr').forEach(row=>{
+      const children=row.children;
+      if(children.length>=2){
+        addRow(safeTextOf(children[0]),safeTextOf(children[children.length-1]));
+      }
+    });
+  });
+
+  // 4. Sectioned layout: h3/h4 headers followed by key-value pairs
+  // Look for common section headers like "Specifications", "Features", etc.
+  const sectionHeaders=document.querySelectorAll('h2,h3,h4,h5,[class*="section-title"],[class*="sectionTitle"],[class*="heading"],[class*="Heading"]');
+  sectionHeaders.forEach(header=>{
+    const sectionText=safeTextOf(header);
+    if(/specific|feature|detail|attribute|property|general|port|power|keyboard|warranty|display|memory|storage|processor|graphic|battery|dimension|weight/i.test(sectionText)){
+      // Find following siblings until next header
+      let next=header.nextElementSibling;
+      while(next&&!/^(h[2-6]|div|section)$/i.test(next.tagName)||(next.classList.length===0&&next.id==='')){
+        if(next.matches('[class*="label"],[class*="Label"],[class*="name"],[class*="Name"],dt,th,[class*="key"],[class*="Key"]')){
+          const key=safeTextOf(next);
+          let value='';
+          let valEl=next.nextElementSibling;
+          while(valEl&&!value){
+            value=safeTextOf(valEl);
+            valEl=valEl.nextElementSibling;
+          }
+          addRow(key,value);
+        }
+        next=next.nextElementSibling;
+      }
+    }
+  });
+
+  // 5. Fallback: parse text content for "Key: Value" or "Key\tValue" patterns
+  if(rows.length<5){
+    const bodyText=document.body.textContent||'';
+    const lines=bodyText.split(/\n|\r/).map(l=>l.trim()).filter(l=>l.length>0&&l.length<500);
+    lines.forEach(line=>{
+      // Match "Key: Value" or "Key\tValue" or "Key  Value" (double space)
+      const match=line.match(/^([^:\t]{3,80})[:]\s*(.+)$/)||line.match(/^([^:\t]{3,80})\t+(.+)$/)||line.match(/^([^:\t]{3,80})\s{2,}(.+)$/);
+      if(match){
+        addRow(match[1],match[2]);
       }
     });
   }
-  // De-dupe by key, prefer the longest value.
-  const byKey=new Map();
-  rows.forEach(r=>{
-    const prev=byKey.get(r.key);
-    if(!prev||r.value.length>prev.length)byKey.set(r.key,r.value);
+
+  // 6. Specific advice.co.th patterns - look for common spec labels
+  const specLabels=[
+    'Processor','Chipset','AI Engine','Graphics','Display','Display Screen','Main Memory','Memory Slot','Max Memory',
+    'Storage','Storage Slot','Optical Disk Drive','Web Camera','Sound Technology','Audio Jack','Speaker','OS',
+    'Network','Wireless','Bluetooth','Ports','CardReader','Power Adapter','Battery',
+    'Dimension','Net Weight','Package Dimension','Gross Weight','Volume','Material',
+    'Keyboard Type','Backlit','Touchpad','Finger Print','Warranty','Brand','Model'
+  ];
+  specLabels.forEach(label=>{
+    if(seenKeys.has(label.toLowerCase()))return;
+    // Search in text for "Label Value" pattern
+    const escapedLabel=label.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+    const regex=new RegExp(escapedLabel+'\\s*[:]?\\s*([^\\n\\r]{5,200})','i');
+    const match=(document.body.textContent||'').match(regex);
+    if(match){
+      addRow(label,match[1].trim());
+    }
   });
-  return Array.from(byKey.entries()).map(([key,value])=>({key,value}));
+
+  return rows;
 }
 
 function extractFreeGiftsDetail(){
@@ -984,20 +1070,118 @@ function _kDetailFromWindow(win, fallbackUrl) {
     });
     out.description = desc;
 
-    // Specs table
-    const specRows = [];
-    doc.querySelectorAll('table tr').forEach(tr => {
-      const ths = tr.querySelectorAll('th,td');
-      if (ths.length >= 2) {
-        const k = _safeTextOf(ths[0]);
-        const v = _safeTextOf(ths[ths.length - 1]);
-        if (k && v && k !== v && k.length < 80 && v.length < 1000) specRows.push({ key: k, value: v });
+    // Specs table - enhanced extraction for multiple formats
+    function extractSpecsFromDoc(d) {
+      const rows = [];
+      const seenKeys = new Set();
+
+      function addRow(key, value) {
+        if (!key || !value || key === value || key.length > 120 || value.length > 2000) return;
+        const normKey = key.toLowerCase().trim();
+        if (seenKeys.has(normKey)) return;
+        seenKeys.add(normKey);
+        rows.push({ key: key.trim(), value: value.trim() });
       }
-    });
-    // Dedupe by key
-    const byKey = new Map();
-    specRows.forEach(r => { if (!byKey.has(r.key) || r.value.length > byKey.get(r.key).length) byKey.set(r.key, r.value); });
-    out.specifications = Array.from(byKey.entries()).map(([k, v]) => ({ key: k, value: v }));
+
+      // 1. Table-based (th/td)
+      d.querySelectorAll('table tr').forEach(tr => {
+        const cells = tr.querySelectorAll('th, td');
+        if (cells.length >= 2) {
+          addRow(_safeTextOf(cells[0]), _safeTextOf(cells[cells.length - 1]));
+        }
+      });
+
+      // 2. Definition lists (dl/dt/dd)
+      d.querySelectorAll('dl').forEach(dl => {
+        const dts = dl.querySelectorAll('dt');
+        const dds = dl.querySelectorAll('dd');
+        dts.forEach((dt, i) => {
+          addRow(_safeTextOf(dt), _safeTextOf(dds[i] || ''));
+        });
+      });
+
+      // 3. Div/span label-value pairs in spec/feature/detail containers
+      const specContainers = d.querySelectorAll('[class*="spec"],[class*="Spec"],[class*="feature"],[class*="Feature"],[class*="detail"],[class*="Detail"],[class*="attribute"],[class*="Attribute"],[class*="property"],[class*="Property"]');
+      specContainers.forEach(container => {
+        const labels = container.querySelectorAll('[class*="label"],[class*="Label"],[class*="name"],[class*="Name"],[class*="key"],[class*="Key"],[class*="title"],[class*="Title"],dt,th');
+        labels.forEach(label => {
+          const key = _safeTextOf(label);
+          let value = '';
+          let next = label.nextElementSibling;
+          while (next && !value) {
+            value = _safeTextOf(next);
+            next = next.nextElementSibling;
+          }
+          if (!value && label.parentElement) {
+            value = _safeTextOf(label.parentElement.lastElementChild);
+          }
+          addRow(key, value);
+        });
+
+        container.querySelectorAll('[class*="row"],[class*="Row"],[class*="item"],[class*="Item"],div,tr').forEach(row => {
+          const children = row.children;
+          if (children.length >= 2) {
+            addRow(_safeTextOf(children[0]), _safeTextOf(children[children.length - 1]));
+          }
+        });
+      });
+
+      // 4. Sectioned layout: headers followed by key-value pairs
+      const sectionHeaders = d.querySelectorAll('h2,h3,h4,h5,[class*="section-title"],[class*="sectionTitle"],[class*="heading"],[class*="Heading"]');
+      sectionHeaders.forEach(header => {
+        const sectionText = _safeTextOf(header);
+        if (/specific|feature|detail|attribute|property|general|port|power|keyboard|warranty|display|memory|storage|processor|graphic|battery|dimension|weight/i.test(sectionText)) {
+          let next = header.nextElementSibling;
+          while (next && !/^(h[2-6]|div|section)$/i.test(next.tagName) || (next.classList.length === 0 && next.id === '')) {
+            if (next.matches('[class*="label"],[class*="Label"],[class*="name"],[class*="Name"],dt,th,[class*="key"],[class*="Key"]')) {
+              const key = _safeTextOf(next);
+              let value = '';
+              let valEl = next.nextElementSibling;
+              while (valEl && !value) {
+                value = _safeTextOf(valEl);
+                valEl = valEl.nextElementSibling;
+              }
+              addRow(key, value);
+            }
+            next = next.nextElementSibling;
+          }
+        }
+      });
+
+      // 5. Fallback: parse text content for "Key: Value" patterns
+      if (rows.length < 5) {
+        const bodyText = d.body.textContent || '';
+        const lines = bodyText.split(/\n|\r/).map(l => l.trim()).filter(l => l.length > 0 && l.length < 500);
+        lines.forEach(line => {
+          const match = line.match(/^([^:\t]{3,80})[:]\s*(.+)$/) || line.match(/^([^:\t]{3,80})\t+(.+)$/) || line.match(/^([^:\t]{3,80})\s{2,}(.+)$/);
+          if (match) {
+            addRow(match[1], match[2]);
+          }
+        });
+      }
+
+      // 6. Specific advice.co.th patterns - common spec labels
+      const specLabels = [
+        'Processor', 'Chipset', 'AI Engine', 'Graphics', 'Display', 'Display Screen', 'Main Memory', 'Memory Slot', 'Max Memory',
+        'Storage', 'Storage Slot', 'Optical Disk Drive', 'Web Camera', 'Sound Technology', 'Audio Jack', 'Speaker', 'OS',
+        'Network', 'Wireless', 'Bluetooth', 'Ports', 'CardReader', 'Power Adapter', 'Battery',
+        'Dimension', 'Net Weight', 'Package Dimension', 'Gross Weight', 'Volume', 'Material',
+        'Keyboard Type', 'Backlit', 'Touchpad', 'Finger Print', 'Warranty', 'Brand', 'Model'
+      ];
+      specLabels.forEach(label => {
+        if (seenKeys.has(label.toLowerCase())) return;
+        const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const regex = new RegExp(escapedLabel + '\\s*[:]?\\s*([^\n\r]{5,200})', 'i');
+        const match = (d.body.textContent || '').match(regex);
+        if (match) {
+          addRow(label, match[1].trim());
+        }
+      });
+
+      return rows;
+    }
+
+    out.specifications = extractSpecsFromDoc(doc);
 
     // Free gifts detail
     const gifts = [];
