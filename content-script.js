@@ -63,6 +63,205 @@ function extractPrice(text){
   return{str:'฿'+last,val:U('฿'+last)};
 }
 
+// ─── Text cleaning utilities ─────────────────────────────────────────────
+function stripThai(text){
+  if(!text)return '';
+  return text.replace(/[\u0E00-\u0E7F]+/g,' ').replace(/\s+/g,' ').trim();
+}
+function hasThai(text){
+  return /[\u0E00-\u0E7F]/.test(text);
+}
+function isMostlyEnglish(text){
+  if(!text)return false;
+  const latin=(text.match(/[a-zA-Z0-9]/g)||[]).length;
+  return latin/Math.max(text.length,1)>0.4;
+}
+function cleanHtmlEntities(text){
+  if(!text)return '';
+  return text
+    .replace(/<[^>]*>/g,'')
+    .replace(/&nbsp;/gi,' ')
+    .replace(/&reg;/gi,'®')
+    .replace(/&trade;/gi,'™')
+    .replace(/&amp;/gi,'&')
+    .replace(/&lt;/gi,'<')
+    .replace(/&gt;/gi,'>')
+    .replace(/&quot;/gi,'"')
+    .replace(/&#(\d+);?/g,(_,d)=>String.fromCharCode(parseInt(d,10)))
+    .replace(/&#x([0-9a-fA-F]+);?/g,(_,h)=>String.fromCharCode(parseInt(h,16)))
+    .replace(/\\u003C[^>]*>/g,'')
+    .replace(/\\/g,'')
+    .replace(/\s+/g,' ')
+    .trim();
+}
+function isGarbageSpecValue(value){
+  if(!value)return true;
+  if(value.includes('{')&&value.includes('}'))return true;
+  if(value.includes('\\u003C'))return true;
+  if(value.includes('[{')||value.includes('}]'))return true;
+  if(value.includes('"title"')||value.includes('"value"')||value.includes('"data"')||value.includes('"data_eng"'))return true;
+  if(value.startsWith(',')||value.startsWith('"'))return true;
+  if(value.length>300&&value.includes(','))return true;
+  return false;
+}
+function isGarbageSpecKey(key){
+  if(!key)return true;
+  const skip=[
+    'compare','add to','payment','installment details','free gift',
+    'show','view more','wishlist','share','cart','buy',
+    'easy payment','warranty terms','choose your'
+  ];
+  const kl=key.toLowerCase().trim();
+  if(skip.some(s=>kl.startsWith(s)))return true;
+  if(kl.length<2)return true;
+  return false;
+}
+
+// ─── NUXT_DATA parser for specs ─────────────────────────────────────────
+// advice.co.th stores specs in a script#__NUXT_DATA__ JSON blob, NOT in the DOM.
+// This parses that indexed array format and extracts English specs.
+function parseNuxtSpecs(doc){
+  try{
+    const scriptEl=doc.querySelector('script#__NUXT_DATA__');
+    if(!scriptEl)return[];
+    const raw=scriptEl.textContent;
+    if(!raw)return[];
+    const arr=JSON.parse(raw);
+    if(!Array.isArray(arr)||arr.length<10)return[];
+
+    // Helper: resolve an index reference to its actual value
+    function resolve(idx){
+      if(typeof idx!=='number'||idx<0||idx>=arr.length)return'';
+      const v=arr[idx];
+      if(v===null||v===undefined)return'';
+      if(typeof v==='string')return v;
+      if(typeof v==='number'||typeof v==='boolean')return String(v);
+      return'';
+    }
+
+    // Helper: resolve an HTML-wrapped value (strip <p>, &nbsp;, etc.)
+    function resolveHtml(idx){
+      let s=resolve(idx);
+      if(!s)return'';
+      // Strip HTML tags
+      s=s.replace(/<[^>]*>/g,'');
+      // Decode common HTML entities
+      s=s.replace(/&nbsp;/gi,' ').replace(/&reg;/gi,'®').replace(/&trade;/gi,'™')
+         .replace(/&amp;/gi,'&').replace(/&lt;/gi,'<').replace(/&gt;/gi,'>')
+         .replace(/&quot;/gi,'"').replace(/&#(\d+);?/g,(_,d)=>String.fromCharCode(parseInt(d,10)))
+         .replace(/&#x([0-9a-fA-F]+);?/g,(_,h)=>String.fromCharCode(parseInt(h,16)));
+      return s.replace(/\s+/g,' ').trim();
+    }
+
+    // Find the product object in the array — look for one that has "spec_detail"
+    let productIdx=-1;
+    for(let i=0;i<Math.min(arr.length,50);i++){
+      if(arr[i]&&typeof arr[i]==='object'&&!Array.isArray(arr[i])){
+        const keys=Object.keys(arr[i]);
+        if(keys.includes('spec_detail')||keys.includes('spec')){
+          productIdx=i;
+          break;
+        }
+      }
+    }
+    if(productIdx<0)return[];
+
+    const product=arr[productIdx];
+    const specDetailIdx=product.spec_detail;
+    if(typeof specDetailIdx!=='number')return[];
+    const specDetail=arr[specDetailIdx];
+    if(!Array.isArray(specDetail))return[];
+
+    const rows=[];
+    const seenKeys=new Set();
+
+    // Each element in specDetail is a category object index
+    for(const catIdx of specDetail){
+      const cat=arr[catIdx];
+      if(!cat||typeof cat!=='object')continue;
+
+      // Prefer data_eng (English) over data (current language)
+      let itemsIdx=cat.data_eng||cat.data;
+      if(typeof itemsIdx!=='number')continue;
+      const items=arr[itemsIdx];
+      if(!Array.isArray(items))continue;
+
+      for(const itemIdx of items){
+        const item=arr[itemIdx];
+        if(!item||typeof item!=='object')continue;
+        const title=resolve(item.title);
+        let value=resolveHtml(item.value);
+        if(!title||!value)continue;
+        // Clean Thai from value
+        value=stripThai(value);
+        if(!value)continue;
+        const normKey=title.toLowerCase().trim();
+        if(seenKeys.has(normKey))continue;
+        seenKeys.add(normKey);
+        rows.push({key:title.trim(),value});
+      }
+    }
+    return rows;
+  }catch(e){
+    console.warn('[scraper] parseNuxtSpecs error:',e);
+    return[];
+  }
+}
+
+// Also extract product name, model, brand from NUXT data
+function parseNuxtProductInfo(doc){
+  try{
+    const scriptEl=doc.querySelector('script#__NUXT_DATA__');
+    if(!scriptEl)return null;
+    const arr=JSON.parse(scriptEl.textContent);
+    if(!Array.isArray(arr)||arr.length<10)return null;
+
+    function resolve(idx){
+      if(typeof idx!=='number'||idx<0||idx>=arr.length)return'';
+      const v=arr[idx];
+      if(typeof v==='string')return v;
+      if(typeof v==='number'||typeof v==='boolean')return String(v);
+      return'';
+    }
+
+    // Find product object
+    let productIdx=-1;
+    for(let i=0;i<Math.min(arr.length,50);i++){
+      if(arr[i]&&typeof arr[i]==='object'&&!Array.isArray(arr[i])){
+        const keys=Object.keys(arr[i]);
+        if(keys.includes('spec_detail')||keys.includes('spec')){
+          productIdx=i;
+          break;
+        }
+      }
+    }
+    if(productIdx<0)return null;
+    const product=arr[productIdx];
+
+    // Extract product name — look for the "name" field
+    let name='';
+    if(product.name!==undefined)name=resolve(product.name);
+    // Also try "title"
+    if(!name&&product.title!==undefined)name=resolve(product.title);
+
+    // Extract SKU
+    let sku='';
+    if(product.sku!==undefined)sku=resolve(product.sku);
+
+    // Extract brand
+    let brand='';
+    if(product.brand!==undefined)brand=resolve(product.brand);
+
+    // Extract spec summary
+    let specSummary='';
+    if(product.spec!==undefined)specSummary=resolve(product.spec);
+
+    return{name,sku,brand,specSummary};
+  }catch(e){
+    return null;
+  }
+}
+
 const brandKeywords=[
   "MSI","ASUS","Acer","Lenovo","HP","Dell","Apple","MacBook","Huawei","Samsung",
   "LG","Razer","Gigabyte","GPD","Mechrevo","InBook","Alienware","ROG","TUF",
@@ -94,17 +293,37 @@ function extractBrand(name){
 
 function extractProductCode(url){
   if(!url)return"";
-  // Match pattern: /product/notebook-msi-xxx-PRODUCTCODE-001TH or /product/notebook/.../PRODUCTCODE
+  // Extract model code from URL slug
+  // e.g., /product/notebook/notebook-dell/notebook-dell-plus-odb16250u701-titan-grey- → ODB16250U701
+  // Try to find a model-like code: letters+digits pattern (e.g., ODB16250U701, 15IAH7H, GF63 Thin 11SC)
+  const slugMatch=url.match(/\/product\/[^/]+\/(.+)/);
+  if(slugMatch){
+    const slug=slugMatch[1];
+    // Find model codes: patterns like odb16250u701, 15iah7h, gf63thin11sc, etc.
+    const modelPatterns=[
+      /([a-z]{2,}[a-z0-9]{3,})/i,  // e.g., odb16250u701, vivobook15
+      /(\d{2}[a-z]+[a-z0-9]*)/i,   // e.g., 15iah7h
+    ];
+    for(const mp of modelPatterns){
+      const matches=[...slug.matchAll(new RegExp(mp,'gi'))];
+      // Pick the most model-like match (has both letters and digits, length >= 5)
+      for(const m of matches){
+        const code=m[1];
+        if(code.length>=5&&/[a-z]/i.test(code)&&/\d/.test(code)){
+          return code.toUpperCase();
+        }
+      }
+    }
+  }
+  // Fallback: original patterns
   const patterns=[
     /\/product\/(?:notebook|laptop)[^-]*-([A-Za-z0-9][A-Za-z0-9_+-]+)(?:-\d+TH)?/i,
-    /\/product\/[^/]+\/([A-Za-z0-9][A-Za-z0-9_+-]+)/,
     /-([A-Za-z0-9][A-Za-z0-9_+-]+)(?:-\d+TH)?$/i,
   ];
   for(const p of patterns){
     const m=url.match(p);
     if(m&&m[1]){
       let code=m[1];
-      // Clean up: remove trailing numbers that are just version numbers
       code=code.replace(/-\d+$/,"");
       return code;
     }
@@ -140,17 +359,17 @@ function extractSpecifications(element){
   }
   
   if(specLines.length>0){
-    return specLines[0];
+    return stripThai(cleanHtmlEntities(specLines[0]));
   }
   return"";
 }
 
 function extractFreeGifts(textContent){
   const gifts=[];
-  // Match "แถมฟรี:" followed by comma-separated items, stopping at price, ประกัน, จัดส่ง, or end
-  const giftMatch=textContent.match(/แถมฟรี:\s*([\s\S]*?)(?=฿|[\d,]+\s*บาท|ประกัน|จัดส่ง|ราคานี้|View more|View More|$)/i);
+  // Match "Free Gift:" or "แถมฟรี:" followed by comma-separated items
+  const giftMatch=textContent.match(/(?:Free Gift|แถมฟรี)[:\s]*([\s\S]*?)(?=฿|[\d,]+\s*(?:บาท|Baht)|Warranty|Shipping|Online|View more|View More|$)/i);
   if(giftMatch){
-    const items=giftMatch[1].split(/,|,/).map(s=>s.trim()).filter(s=>s.length>0);
+    const items=giftMatch[1].split(/,|,/).map(s=>stripThai(s.trim())).filter(s=>s.length>0);
     gifts.push(...items);
   }
   return gifts;
@@ -326,6 +545,19 @@ function k(element,r){
       if(lines.length>0)out.name=lines[0];
     }
 
+    // Clean name: strip Thai marketing text (e.g., "... Titan Grey: ประสิทธิภาพสูง ราคาดี พร้อมโปรโมชั่นพิเศษ!")
+    if(out.name){
+      // Remove Thai suffixes after colon if the rest is Thai
+      out.name=out.name.replace(/[:：]\s*[\u0E00-\u0E7F].*$/,'').trim();
+      // If name is still mostly Thai, try to get English part
+      if(hasThai(out.name)&&!isMostlyEnglish(out.name)){
+        const enPart=out.name.replace(/[\u0E00-\u0E7F]+/g,' ').replace(/\s+/g,' ').trim();
+        if(enPart.length>=10)out.name=enPart;
+      }
+      // Final fallback: strip any remaining Thai
+      out.name=stripThai(out.name);
+    }
+
     // Brand — try class-based element first, then name, then scan card text for brand keyword at start of line.
     const brandEl=element.querySelector('[class*="brand"], .brand, [class*="Brand"], [class*="manufacturer"], [class*="Manufacturer"]');
     if(brandEl)out.brand=safeText(brandEl);
@@ -380,13 +612,22 @@ function k(element,r){
       out.originalPriceValue=U(cleanForOriginal[0]);
     }
 
-    // Warranty.
-    const warrantyMatch=textContent.match(/ประกัน\s*[\dA-Za-zก-๙ .-]+/);
-    if(warrantyMatch)out.warranty=warrantyMatch[0].trim();
+    // Warranty — English only.
+    const warrantyMatch=textContent.match(/Warranty[:\s]*([^\n฿]{3,40})/i);
+    if(warrantyMatch){
+      out.warranty='Warranty: '+warrantyMatch[1].trim().replace(/Shipping.*/i,'').trim();
+    }
 
-    // Shipping.
-    const shippingMatch=textContent.match(/จัดส่ง[^\n฿]*/);
-    if(shippingMatch)out.shipping=shippingMatch[0].trim();
+    // Shipping — English only.
+    const shippingMatch=textContent.match(/(?:Free Shipping|(?:Shipping|จัดส่ง)[:\s]*[^\n฿]{3,40})/i);
+    if(shippingMatch){
+      let s=shippingMatch[0].trim();
+      if(s.includes('Free Shipping'))s='Free Shipping';
+      else s='Shipping: '+s.replace(/^(?:Shipping|จัดส่ง)\s*/i,'').trim();
+      // Strip trailing Thai
+      s=stripThai(s).replace(/Shipping:\s*$/,'').trim();
+      if(s)out.shipping=s;
+    }
 
     // Online only.
     out.isOnlineOnly=textContent.includes("ราคานี้เฉพาะออนไลน์เท่านั้น")||textContent.includes("*Online Only Price")||textContent.includes("Online Only");
@@ -400,7 +641,7 @@ function k(element,r){
 
     // Promotions.
     if(element.querySelector('img[src*="promotion"], [class*="promo"], [class*="Promo"], [class*="COPILOT"]')){
-      out.promotions.push("โปรโมชัน");
+      out.promotions.push("Promotion");
     }
 
     return out;
@@ -448,26 +689,43 @@ function extractDetailImages(){
 }
 
 function extractDescriptionBullets(){
-  // Look for product description feature list. Usually a list of <li> or <p> near the description.
   const out=[];
   const candidates=document.querySelectorAll('[class*="description"] li, [class*="Description"] li, [class*="feature"] li, [class*="Feature"] li, [class*="highlight"] li, [class*="Highlight"] li');
   candidates.forEach(li=>{
-    const t=safeTextOf(li);
-    if(t.length>5&&t.length<500&&!out.includes(t))out.push(t);
+    let t=safeTextOf(li);
+    if(t.length<5||t.length>500||out.includes(t))return;
+    // Skip Thai-only descriptions
+    if(hasThai(t)&&!isMostlyEnglish(t))return;
+    // Strip Thai and clean HTML entities
+    t=cleanHtmlEntities(t);
+    t=stripThai(t);
+    if(t.length>=5)out.push(t);
   });
   return out;
 }
 
 function extractSpecificationsTable(){
+  // PRIMARY: Try parsing from __NUXT_DATA__ (advice.co.th stores specs in JSON, not DOM)
+  const nuxtSpecs=parseNuxtSpecs(document);
+  if(nuxtSpecs.length>0)return nuxtSpecs;
+
+  // FALLBACK: DOM-based extraction (for non-Nuxt pages or if NUXT parsing fails)
   const rows=[];
   const seenKeys=new Set();
 
   function addRow(key,value){
+    key=cleanHtmlEntities(key);
+    value=cleanHtmlEntities(value);
     if(!key||!value||key===value||key.length>120||value.length>2000)return;
+    if(isGarbageSpecKey(key))return;
+    if(isGarbageSpecValue(value))return;
     const normKey=key.toLowerCase().trim();
     if(seenKeys.has(normKey))return;
     seenKeys.add(normKey);
-    rows.push({key:key.trim(),value:value.trim()});
+    const cleanKey=stripThai(key);
+    const cleanValue=stripThai(value);
+    if(!cleanKey||!cleanValue)return;
+    rows.push({key:cleanKey,value:cleanValue});
   }
 
   // 1. Table-based (th/td)
@@ -487,91 +745,25 @@ function extractSpecificationsTable(){
     });
   });
 
-  // 3. Div/span label-value pairs in spec/feature/detail containers
-  const specContainers=document.querySelectorAll('[class*="spec"],[class*="Spec"],[class*="feature"],[class*="Feature"],[class*="detail"],[class*="Detail"],[class*="attribute"],[class*="Attribute"],[class*="property"],[class*="Property"]');
-  specContainers.forEach(container=>{
-    // Pattern: label + value as siblings
-    const labels=container.querySelectorAll('[class*="label"],[class*="Label"],[class*="name"],[class*="Name"],[class*="key"],[class*="Key"],[class*="title"],[class*="Title"],dt,th');
-    labels.forEach(label=>{
-      const key=safeTextOf(label);
-      let value='';
-      // Next sibling
-      let next=label.nextElementSibling;
-      while(next&&!value){
-        value=safeTextOf(next);
-        next=next.nextElementSibling;
-      }
-      // Or parent's last child
-      if(!value&&label.parentElement){
-        value=safeTextOf(label.parentElement.lastElementChild);
-      }
-      addRow(key,value);
-    });
-
-    // Pattern: rows with two children (key, value)
-    container.querySelectorAll('[class*="row"],[class*="Row"],[class*="item"],[class*="Item"],div,tr').forEach(row=>{
-      const children=row.children;
-      if(children.length>=2){
-        addRow(safeTextOf(children[0]),safeTextOf(children[children.length-1]));
-      }
-    });
-  });
-
-  // 4. Sectioned layout: h3/h4 headers followed by key-value pairs
-  // Look for common section headers like "Specifications", "Features", etc.
-  const sectionHeaders=document.querySelectorAll('h2,h3,h4,h5,[class*="section-title"],[class*="sectionTitle"],[class*="heading"],[class*="Heading"]');
-  sectionHeaders.forEach(header=>{
-    const sectionText=safeTextOf(header);
-    if(/specific|feature|detail|attribute|property|general|port|power|keyboard|warranty|display|memory|storage|processor|graphic|battery|dimension|weight/i.test(sectionText)){
-      // Find following siblings until next header
-      let next=header.nextElementSibling;
-      while(next&&!/^(h[2-6]|div|section)$/i.test(next.tagName)||(next.classList.length===0&&next.id==='')){
-        if(next.matches('[class*="label"],[class*="Label"],[class*="name"],[class*="Name"],dt,th,[class*="key"],[class*="Key"]')){
-          const key=safeTextOf(next);
-          let value='';
-          let valEl=next.nextElementSibling;
-          while(valEl&&!value){
-            value=safeTextOf(valEl);
-            valEl=valEl.nextElementSibling;
-          }
-          addRow(key,value);
-        }
-        next=next.nextElementSibling;
-      }
-    }
-  });
-
-  // 5. Fallback: parse text content for "Key: Value" or "Key\tValue" patterns
+  // 3. Fallback: spec labels via text search
   if(rows.length<5){
-    const bodyText=document.body.textContent||'';
-    const lines=bodyText.split(/\n|\r/).map(l=>l.trim()).filter(l=>l.length>0&&l.length<500);
-    lines.forEach(line=>{
-      // Match "Key: Value" or "Key\tValue" or "Key  Value" (double space)
-      const match=line.match(/^([^:\t]{3,80})[:]\s*(.+)$/)||line.match(/^([^:\t]{3,80})\t+(.+)$/)||line.match(/^([^:\t]{3,80})\s{2,}(.+)$/);
+    const specLabels=[
+      'Processor','Chipset','AI Engine','Graphics','Display Screen','Main Memory','Memory Slot','Max Memory',
+      'Storage','Storage Slot','Web Camera','Sound Technology','Audio Jack','Speaker','OS',
+      'Wireless','Bluetooth','Ports','Power Adapter','Battery',
+      'Dimension','Net Weight','Package Dimension','Gross Weight','Volume','Material',
+      'Keyboard Type','Backlit','Touchpad','Finger Print','Warranty','Brand','Model'
+    ];
+    specLabels.forEach(label=>{
+      if(seenKeys.has(label.toLowerCase()))return;
+      const escapedLabel=label.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+      const regex=new RegExp(escapedLabel+'\\s*[:]?\\s*([^\\n\\r]{5,200})','i');
+      const match=(document.body.textContent||'').match(regex);
       if(match){
-        addRow(match[1],match[2]);
+        addRow(label,match[1].trim());
       }
     });
   }
-
-  // 6. Specific advice.co.th patterns - look for common spec labels
-  const specLabels=[
-    'Processor','Chipset','AI Engine','Graphics','Display','Display Screen','Main Memory','Memory Slot','Max Memory',
-    'Storage','Storage Slot','Optical Disk Drive','Web Camera','Sound Technology','Audio Jack','Speaker','OS',
-    'Network','Wireless','Bluetooth','Ports','CardReader','Power Adapter','Battery',
-    'Dimension','Net Weight','Package Dimension','Gross Weight','Volume','Material',
-    'Keyboard Type','Backlit','Touchpad','Finger Print','Warranty','Brand','Model'
-  ];
-  specLabels.forEach(label=>{
-    if(seenKeys.has(label.toLowerCase()))return;
-    // Search in text for "Label Value" pattern
-    const escapedLabel=label.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
-    const regex=new RegExp(escapedLabel+'\\s*[:]?\\s*([^\\n\\r]{5,200})','i');
-    const match=(document.body.textContent||'').match(regex);
-    if(match){
-      addRow(label,match[1].trim());
-    }
-  });
 
   return rows;
 }
@@ -642,18 +834,40 @@ function k_detail(url){
     out.url=url||window.location.href;
     out.productCode=extractProductCode(out.url);
 
+    // Try NUXT data for clean name/brand first
+    const nuxtInfo=parseNuxtProductInfo(document);
+    if(nuxtInfo&&nuxtInfo.name){
+      out.name=stripThai(nuxtInfo.name.replace(/[:：]\s*[\u0E00-\u0E7F].*$/,'').trim());
+    }
+
     // Name: usually in <h1>, or meta og:title.
-    const h1=document.querySelector('h1');
-    if(h1)out.name=safeTextOf(h1);
+    if(!out.name){
+      const h1=document.querySelector('h1');
+      if(h1)out.name=safeTextOf(h1);
+    }
     if(!out.name){
       const og=document.querySelector('meta[property="og:title"]');
       if(og)out.name=(og.getAttribute("content")||"").trim();
     }
     if(!out.name)out.name=document.title||"";
+    // Clean name: strip Thai marketing text
+    if(out.name){
+      out.name=out.name.replace(/[:：]\s*[\u0E00-\u0E7F].*$/,'').trim();
+      if(hasThai(out.name)&&!isMostlyEnglish(out.name)){
+        const enPart=out.name.replace(/[\u0E00-\u0E7F]+/g,' ').replace(/\s+/g,' ').trim();
+        if(enPart.length>=10)out.name=enPart;
+      }
+      out.name=stripThai(out.name);
+    }
 
-    // Brand: same logic as listing — try class, then extract from name.
-    const brandEl=document.querySelector('[class*="brand"], .brand, [class*="Brand"], [class*="manufacturer"], [class*="Manufacturer"]');
-    if(brandEl)out.brand=safeTextOf(brandEl);
+    // Brand: try NUXT data, then class, then extract from name.
+    if(nuxtInfo&&nuxtInfo.brand){
+      out.brand=stripThai(nuxtInfo.brand);
+    }
+    if(!out.brand){
+      const brandEl=document.querySelector('[class*="brand"], .brand, [class*="Brand"], [class*="manufacturer"], [class*="Manufacturer"]');
+      if(brandEl)out.brand=safeTextOf(brandEl);
+    }
     if(!out.brand&&out.name)out.brand=extractBrand(out.name);
 
     // SKU.
@@ -709,12 +923,12 @@ function k_detail(url){
       out.discount=(discountMatch[0].match(/฿\s*[\d,]+|&#?\w+;\s*[\d,]+/i)||[discountMatch[0]])[0];
     }
 
-    // Warranty.
-    const warrantyMatch=(document.body.textContent||"").match(/Warranty[^.\n]{0,40}|ประกัน[^.\n]{0,40}/i);
-    if(warrantyMatch)out.warranty=warrantyMatch[0].trim();
+    // Warranty — English only.
+    const warrantyMatch=(document.body.textContent||"").match(/Warranty[:\s]*([^\n฿]{3,40})/i);
+    if(warrantyMatch)out.warranty='Warranty: '+warrantyMatch[1].trim().replace(/Shipping.*/i,'').trim();
 
-    // Shipping.
-    if((document.body.textContent||"").includes("Free Shipping")||(document.body.textContent||"").includes("จัดส่งฟรี")){
+    // Shipping — English only.
+    if((document.body.textContent||"").includes("Free Shipping")){
       out.shipping="Free Shipping";
     }
 
@@ -982,18 +1196,40 @@ function _kDetailFromWindow(win, fallbackUrl) {
     };
     out.productCode = _extractProductCode(out.url);
 
-    // Name from h1 or og:title
-    const h1 = doc.querySelector('h1');
-    if (h1) out.name = _safeTextOf(h1);
+    // Try NUXT data for clean name/brand first
+    const nuxtInfo = parseNuxtProductInfo(doc);
+    if (nuxtInfo && nuxtInfo.name) {
+      out.name = stripThai(nuxtInfo.name.replace(/[:：]\s*[\u0E00-\u0E7F].*$/,'').trim());
+    }
+
+    // Name from h1 or og:title (fallback)
+    if (!out.name) {
+      const h1 = doc.querySelector('h1');
+      if (h1) out.name = _safeTextOf(h1);
+    }
     if (!out.name) {
       const og = doc.querySelector('meta[property="og:title"]');
       if (og) out.name = (og.getAttribute('content') || '').trim();
     }
     if (!out.name) out.name = doc.title || '';
+    // Clean name: strip Thai marketing text
+    if(out.name){
+      out.name=out.name.replace(/[:：]\s*[\u0E00-\u0E7F].*$/,'').trim();
+      if(hasThai(out.name)&&!isMostlyEnglish(out.name)){
+        const enPart=out.name.replace(/[\u0E00-\u0E7F]+/g,' ').replace(/\s+/g,' ').trim();
+        if(enPart.length>=10)out.name=enPart;
+      }
+      out.name=stripThai(out.name);
+    }
 
-    // Brand
-    const brandEl = doc.querySelector('[class*="brand"], .brand, [class*="Brand"]');
-    if (brandEl) out.brand = _safeTextOf(brandEl);
+    // Brand: try NUXT data first
+    if (nuxtInfo && nuxtInfo.brand) {
+      out.brand = stripThai(nuxtInfo.brand);
+    }
+    if (!out.brand) {
+      const brandEl = doc.querySelector('[class*="brand"], .brand, [class*="Brand"]');
+      if (brandEl) out.brand = _safeTextOf(brandEl);
+    }
     if (!out.brand && out.name) out.brand = _extractBrand(out.name);
 
     // SKU
@@ -1036,12 +1272,12 @@ function _kDetailFromWindow(win, fallbackUrl) {
     const discM = (doc.body.textContent || '').match(/ประหยัด\s*&#?\w+;?\s*([\d,]+)|ประหยัด\s*฿\s*([\d,]+)/i);
     if (discM) out.discount = (discM[0].match(/฿\s*[\d,]+|&#?\w+;\s*[\d,]+/i) || [discM[0]])[0];
 
-    // Warranty
-    const wM = (doc.body.textContent || '').match(/Warranty[^.\n]{0,40}|ประกัน[^.\n]{0,40}/i);
-    if (wM) out.warranty = wM[0].trim();
+    // Warranty — English only
+    const wM = (doc.body.textContent || '').match(/Warranty[:\s]*([^\n฿]{3,40})/i);
+    if (wM) out.warranty = 'Warranty: ' + wM[1].trim().replace(/Shipping.*/i,'').trim();
 
-    // Shipping
-    if ((doc.body.textContent || '').includes('Free Shipping') || (doc.body.textContent || '').includes('จัดส่งฟรี')) {
+    // Shipping — English only
+    if ((doc.body.textContent || '').includes('Free Shipping')) {
       out.shipping = 'Free Shipping';
     }
 
@@ -1062,25 +1298,42 @@ function _kDetailFromWindow(win, fallbackUrl) {
       });
     out.images = imgs;
 
-    // Description bullets
+    // Description bullets — English only
     const desc = [];
     doc.querySelectorAll('[class*="description"] li,[class*="Description"] li,[class*="feature"] li,[class*="Feature"] li,[class*="highlight"] li').forEach(li => {
-      const t = _safeTextOf(li);
-      if (t.length > 5 && t.length < 500 && !desc.includes(t)) desc.push(t);
+      let t = _safeTextOf(li);
+      if (t.length < 5 || t.length > 500 || desc.includes(t)) return;
+      // Skip Thai-only descriptions
+      if (hasThai(t) && !isMostlyEnglish(t)) return;
+      t = cleanHtmlEntities(t);
+      t = stripThai(t);
+      if (t.length >= 5) desc.push(t);
     });
     out.description = desc;
 
     // Specs table - enhanced extraction for multiple formats
     function extractSpecsFromDoc(d) {
+      // PRIMARY: Try parsing from __NUXT_DATA__
+      const nuxtSpecs = parseNuxtSpecs(d);
+      if (nuxtSpecs.length > 0) return nuxtSpecs;
+
+      // FALLBACK: DOM-based extraction
       const rows = [];
       const seenKeys = new Set();
 
       function addRow(key, value) {
+        key = cleanHtmlEntities(key);
+        value = cleanHtmlEntities(value);
         if (!key || !value || key === value || key.length > 120 || value.length > 2000) return;
+        if (isGarbageSpecKey(key)) return;
+        if (isGarbageSpecValue(value)) return;
         const normKey = key.toLowerCase().trim();
         if (seenKeys.has(normKey)) return;
         seenKeys.add(normKey);
-        rows.push({ key: key.trim(), value: value.trim() });
+        const cleanKey = stripThai(key);
+        const cleanValue = stripThai(value);
+        if (!cleanKey || !cleanValue) return;
+        rows.push({ key: cleanKey, value: cleanValue });
       }
 
       // 1. Table-based (th/td)
@@ -1100,83 +1353,25 @@ function _kDetailFromWindow(win, fallbackUrl) {
         });
       });
 
-      // 3. Div/span label-value pairs in spec/feature/detail containers
-      const specContainers = d.querySelectorAll('[class*="spec"],[class*="Spec"],[class*="feature"],[class*="Feature"],[class*="detail"],[class*="Detail"],[class*="attribute"],[class*="Attribute"],[class*="property"],[class*="Property"]');
-      specContainers.forEach(container => {
-        const labels = container.querySelectorAll('[class*="label"],[class*="Label"],[class*="name"],[class*="Name"],[class*="key"],[class*="Key"],[class*="title"],[class*="Title"],dt,th');
-        labels.forEach(label => {
-          const key = _safeTextOf(label);
-          let value = '';
-          let next = label.nextElementSibling;
-          while (next && !value) {
-            value = _safeTextOf(next);
-            next = next.nextElementSibling;
-          }
-          if (!value && label.parentElement) {
-            value = _safeTextOf(label.parentElement.lastElementChild);
-          }
-          addRow(key, value);
-        });
-
-        container.querySelectorAll('[class*="row"],[class*="Row"],[class*="item"],[class*="Item"],div,tr').forEach(row => {
-          const children = row.children;
-          if (children.length >= 2) {
-            addRow(_safeTextOf(children[0]), _safeTextOf(children[children.length - 1]));
-          }
-        });
-      });
-
-      // 4. Sectioned layout: headers followed by key-value pairs
-      const sectionHeaders = d.querySelectorAll('h2,h3,h4,h5,[class*="section-title"],[class*="sectionTitle"],[class*="heading"],[class*="Heading"]');
-      sectionHeaders.forEach(header => {
-        const sectionText = _safeTextOf(header);
-        if (/specific|feature|detail|attribute|property|general|port|power|keyboard|warranty|display|memory|storage|processor|graphic|battery|dimension|weight/i.test(sectionText)) {
-          let next = header.nextElementSibling;
-          while (next && !/^(h[2-6]|div|section)$/i.test(next.tagName) || (next.classList.length === 0 && next.id === '')) {
-            if (next.matches('[class*="label"],[class*="Label"],[class*="name"],[class*="Name"],dt,th,[class*="key"],[class*="Key"]')) {
-              const key = _safeTextOf(next);
-              let value = '';
-              let valEl = next.nextElementSibling;
-              while (valEl && !value) {
-                value = _safeTextOf(valEl);
-                valEl = valEl.nextElementSibling;
-              }
-              addRow(key, value);
-            }
-            next = next.nextElementSibling;
-          }
-        }
-      });
-
-      // 5. Fallback: parse text content for "Key: Value" patterns
+      // 3. Fallback: spec labels via text search
       if (rows.length < 5) {
-        const bodyText = d.body.textContent || '';
-        const lines = bodyText.split(/\n|\r/).map(l => l.trim()).filter(l => l.length > 0 && l.length < 500);
-        lines.forEach(line => {
-          const match = line.match(/^([^:\t]{3,80})[:]\s*(.+)$/) || line.match(/^([^:\t]{3,80})\t+(.+)$/) || line.match(/^([^:\t]{3,80})\s{2,}(.+)$/);
+        const specLabels = [
+          'Processor', 'Chipset', 'AI Engine', 'Graphics', 'Display Screen', 'Main Memory', 'Memory Slot', 'Max Memory',
+          'Storage', 'Storage Slot', 'Web Camera', 'Sound Technology', 'Audio Jack', 'Speaker', 'OS',
+          'Wireless', 'Bluetooth', 'Ports', 'Power Adapter', 'Battery',
+          'Dimension', 'Net Weight', 'Package Dimension', 'Gross Weight', 'Volume', 'Material',
+          'Keyboard Type', 'Backlit', 'Touchpad', 'Finger Print', 'Warranty', 'Brand', 'Model'
+        ];
+        specLabels.forEach(label => {
+          if (seenKeys.has(label.toLowerCase())) return;
+          const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const regex = new RegExp(escapedLabel + '\\s*[:]?\\s*([^\\n\\r]{5,200})', 'i');
+          const match = (d.body.textContent || '').match(regex);
           if (match) {
-            addRow(match[1], match[2]);
+            addRow(label, match[1].trim());
           }
         });
       }
-
-      // 6. Specific advice.co.th patterns - common spec labels
-      const specLabels = [
-        'Processor', 'Chipset', 'AI Engine', 'Graphics', 'Display', 'Display Screen', 'Main Memory', 'Memory Slot', 'Max Memory',
-        'Storage', 'Storage Slot', 'Optical Disk Drive', 'Web Camera', 'Sound Technology', 'Audio Jack', 'Speaker', 'OS',
-        'Network', 'Wireless', 'Bluetooth', 'Ports', 'CardReader', 'Power Adapter', 'Battery',
-        'Dimension', 'Net Weight', 'Package Dimension', 'Gross Weight', 'Volume', 'Material',
-        'Keyboard Type', 'Backlit', 'Touchpad', 'Finger Print', 'Warranty', 'Brand', 'Model'
-      ];
-      specLabels.forEach(label => {
-        if (seenKeys.has(label.toLowerCase())) return;
-        const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const regex = new RegExp(escapedLabel + '\\s*[:]?\\s*([^\n\r]{5,200})', 'i');
-        const match = (d.body.textContent || '').match(regex);
-        if (match) {
-          addRow(label, match[1].trim());
-        }
-      });
 
       return rows;
     }
@@ -1251,12 +1446,29 @@ function _extractBrand(name) {
 
 function _extractProductCode(url) {
   if (!url) return '';
+  // Extract model code from URL slug — same logic as extractProductCode
+  const slugMatch = url.match(/\/product\/[^/]+\/(.+)/);
+  if (slugMatch) {
+    const slug = slugMatch[1];
+    const modelPatterns = [
+      /([a-z]{2,}[a-z0-9]{3,})/i,
+      /(\d{2}[a-z]+[a-z0-9]*)/i,
+    ];
+    for (const mp of modelPatterns) {
+      const matches = [...slug.matchAll(new RegExp(mp, 'gi'))];
+      for (const m of matches) {
+        const code = m[1];
+        if (code.length >= 5 && /[a-z]/i.test(code) && /\d/.test(code)) {
+          return code.toUpperCase();
+        }
+      }
+    }
+  }
   const patterns = [
     /\/product\/(?:notebook|laptop)[^-]*-([A-Za-z0-9][A-Za-z0-9_+-]+)(?:-\d+TH)?/i,
-    /\/product\/[^/]+\/([A-Za-z0-9][A-Za-z0-9_+-]+)/,
     /-([A-Za-z0-9][A-Za-z0-9_+-]+)(?:-\d+TH)?$/i,
   ];
-  for (const p of patterns) { const m = url.match(p); if (m && m[1]) return m[1].replace(/-\d+$/, ''); }
+  for (const p of patterns) { const m = url.match(p); if (m && m[1]) return m[1].replace(/-\d+$/, '').toUpperCase(); }
   return '';
 }
 

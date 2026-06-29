@@ -6,6 +6,11 @@ let lastScrapedData = null;
 const DETAIL_BATCH_DELAY_MS = 1200;
 const DETAIL_TAB_TIMEOUT_MS = 30000;
 
+function stripThai(text) {
+  if (!text) return '';
+  return text.replace(/[\u0E00-\u0E7F]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
 // Keep-alive: MV3 service workers die ~30s after last event.
 // Use both setInterval (fires every 15s) AND chrome.alarms (wakes SW) for redundancy.
 let _heartbeatTimer = null;
@@ -275,22 +280,22 @@ function productsToCsv(products) {
   const rows = [CSV_COLUMNS.join(",")];
   for (const p of products) {
     const specsTable = Array.isArray(p.specifications)
-      ? p.specifications.map(r => `${r.key}=${r.value}`).join(" | ")
+      ? p.specifications.map(r => `${stripThai(r.key)}=${stripThai(r.value)}`).join(" | ")
       : "";
-    const description = Array.isArray(p.description) ? p.description.join(" | ") : "";
+    const description = Array.isArray(p.description) ? p.description.map(d => stripThai(d)).join(" | ") : "";
     const freeGiftsDetail = Array.isArray(p.freeGiftsDetail)
-      ? p.freeGiftsDetail.map(g => `${g.name} (x${g.quantity}, ${g.price || "฿0"})`).join(" | ")
+      ? p.freeGiftsDetail.map(g => `${stripThai(g.name)} (x${g.quantity}, ${g.price || "฿0"})`).join(" | ")
       : "";
     const allImages = Array.isArray(p.images) ? p.images.join(" | ") : (p.imageUrl || "");
     const row = [
-      p.brand,
-      p.name,
+      stripThai(p.brand),
+      stripThai(p.name),
       p.productCode,
       p.sku,
       p.url,
       p.imageUrl,
       allImages,
-      p.specifications,
+      specsTable,
       description,
       specsTable,
       p.price,
@@ -298,11 +303,11 @@ function productsToCsv(products) {
       p.originalPrice,
       p.originalPriceValue != null ? p.originalPriceValue : "",
       p.discount,
-      p.warranty,
-      p.shipping,
+      stripThai(p.warranty),
+      stripThai(p.shipping),
       p.isOnlineOnly ? "Yes" : "No",
       p.stock,
-      Array.isArray(p.freeGifts) ? p.freeGifts.join("; ") : "",
+      Array.isArray(p.freeGifts) ? p.freeGifts.map(g => stripThai(g)).join("; ") : "",
       freeGiftsDetail,
       p.installment,
       p.detailFetched === true ? "Yes" : (p.detailFetched === false ? "Failed" : ""),
