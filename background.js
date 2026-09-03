@@ -98,6 +98,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return false;
   }
 
+  if (msg.action === "sendToKweelamin") {
+    sendToKweelamin(msg.serverUrl)
+      .then(result => sendResponse(result))
+      .catch(err => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
   return false;
 });
 
@@ -315,6 +322,203 @@ function productsToCsv(products) {
     rows.push(row.join(","));
   }
   return rows.join("\n");
+}
+
+async function captureAdviceCookies() {
+  try {
+    // Try multiple domain patterns to find all relevant cookies
+    const domains = ["advice.co.th", ".advice.co.th", "www.advice.co.th", "img.advice.co.th"];
+    const allCookies = new Map();
+
+    for (const domain of domains) {
+      try {
+        const cookies = await chrome.cookies.getAll({ domain });
+        for (const c of cookies) {
+          allCookies.set(`${c.domain}:${c.name}`, c);
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    const cookies = Array.from(allCookies.values());
+    if (cookies.length === 0) {
+      console.log("[Kweelamin] No advice.co.th cookies found");
+      return null;
+    }
+
+    console.log("[Kweelamin] Captured cookies:");
+    for (const c of cookies) {
+      console.log(`  ${c.name} (domain: ${c.domain}, httpOnly: ${c.httpOnly}, sameSite: ${c.sameSite})`);
+    }
+
+    const cookieString = cookies.map(c => `${c.name}=${c.value}`).join("; ");
+    return cookieString;
+  } catch (e) {
+    console.warn("[Kweelamin] Cookie capture failed:", e.message);
+    return null;
+  }
+}
+
+async function sendToKweelamin(serverUrl) {
+  console.log("[Kweelamin] Starting upload to", serverUrl);
+  const stored = await chrome.storage.local.get("lastScraped");
+  const data = stored.lastScraped;
+  if (!data || !data.products || data.products.length === 0) {
+    return { success: false, error: "No scraped data found. Please scrape first." };
+  }
+
+  const products = data.products;
+  const totalProducts = products.length;
+  console.log("[Kweelamin] Total products:", totalProducts);
+
+  function setProgress(text, percent) {
+    chrome.storage.local.set({ kweelaminProgress: { text, percent, ts: Date.now() } });
+  }
+
+  setProgress(`Uploading ${totalProducts} products...`, 10);
+
+  // Step 1: Capture and send Cloudflare cookies for image proxying
+  setProgress("Capturing Cloudflare cookies...", 5);
+  const cookies = await captureAdviceCookies();
+  if (cookies) {
+    try {
+      const userAgent = navigator.userAgent || "";
+      await fetch(`${serverUrl}/api/advice-cookies`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cookies, userAgent }),
+      });
+      console.log("[Kweelamin] Cookies sent to server");
+    } catch (e) {
+      console.warn("[Kweelamin] Failed to send cookies:", e.message);
+    }
+  }
+
+  const metadataProducts = products.map(p => ({
+    name: p.name,
+    brand: p.brand,
+    url: p.url,
+    priceValue: p.priceValue,
+    originalPriceValue: p.originalPriceValue,
+    specifications: p.specifications,
+    description: p.description,
+    images: p.images || (p.imageUrl ? [p.imageUrl] : []),
+  }));
+
+  let uploadResult;
+  try {
+    const response = await fetch(`${serverUrl}/api/advice-extension-upload`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ products: metadataProducts, skipImages: true }),
+    });
+    uploadResult = await response.json();
+    console.log("[Kweelamin] Upload result:", uploadResult);
+    if (!response.ok) {
+      setProgress("Error: " + (uploadResult.error || "Upload failed"), 0);
+      return { success: false, error: uploadResult.error || "Upload failed" };
+    }
+  } catch (e) {
+    console.error("[Kweelamin] Upload failed:", e);
+    setProgress("Error: " + e.message, 0);
+    return { success: false, error: "Failed to connect: " + e.message };
+  }
+
+  // Step 2: Fetch images via content script on advice.co.th tab
+  let imagesUploaded = 0;
+  let imagesFailed = 0;
+  const [tab] = await chrome.tabs.query({ url: "https://www.advice.co.th/*" });
+
+  if (tab) {
+    // Ensure content script is injected
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ["content-script.js"],
+      });
+      // Wait for the content script to initialize its message listener
+      await new Promise(r => setTimeout(r, 500));
+    } catch (e) {
+      console.warn("[Kweelamin] Content script injection failed (may already be loaded):", e.message);
+    }
+
+    setProgress("Fetching images from advice.co.th...", 30);
+    const BATCH_SIZE = 20;
+
+    for (let batchStart = 0; batchStart < products.length; batchStart += BATCH_SIZE) {
+      const batch = products.slice(batchStart, batchStart + BATCH_SIZE);
+      const items = batch.map(p => ({
+        name: p.name,
+        urls: (p.images || (p.imageUrl ? [p.imageUrl] : [])).slice(0, 5),
+      }));
+
+      const totalImagesInBatch = items.reduce((sum, it) => sum + Math.min(it.urls.length, 5), 0);
+      setProgress(`Fetching images ${batchStart + 1}-${Math.min(batchStart + BATCH_SIZE, products.length)} of ${totalProducts}...`, 30 + Math.floor((batchStart / products.length) * 50));
+
+      try {
+        const fetchResult = await chrome.tabs.sendMessage(tab.id, {
+          action: "fetchImages",
+          items: items,
+        });
+
+        if (fetchResult && fetchResult.results) {
+          for (const r of fetchResult.results) {
+            for (let i = 0; i < r.base64Images.length; i++) {
+              try {
+                const imgResponse = await fetch(`${serverUrl}/api/advice-extension-upload`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    singleImage: true,
+                    productName: r.name,
+                    imageIndex: i,
+                    base64: r.base64Images[i],
+                  }),
+                });
+                if (imgResponse.ok) {
+                  imagesUploaded++;
+                } else {
+                  imagesFailed++;
+                }
+              } catch (e) {
+                imagesFailed++;
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.error("[Kweelamin] Content script fetch failed:", e.message);
+        imagesFailed += totalImagesInBatch;
+      }
+    }
+
+    // Step 3: Apply local images to products
+    setProgress("Applying local images to products...", 90);
+    try {
+      const applyResponse = await fetch(`${serverUrl}/api/advice-extension-upload`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ apply: true }),
+      });
+      const applyResult = await applyResponse.json();
+      console.log("[Kweelamin] Apply result:", applyResult);
+    } catch (e) {
+      console.warn("[Kweelamin] Apply failed:", e.message);
+    }
+  } else {
+    console.log("[Kweelamin] No advice.co.th tab found, skipping images");
+  }
+
+  const msg = `Done! ${uploadResult.synced || 0} products synced, ${imagesUploaded} images uploaded, ${imagesFailed} failed.`;
+  setProgress(msg, 100);
+  console.log("[Kweelamin]", msg);
+
+  return {
+    success: true,
+    synced: uploadResult.synced || 0,
+    skipped: uploadResult.skipped || 0,
+    imagesUploaded,
+    imagesFailed,
+  };
 }
 
 console.log("[Advice Scraper] Background service worker loaded");

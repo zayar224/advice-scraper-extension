@@ -9,11 +9,25 @@
     "storage",
     "downloads",
     "tabs",
-    "alarms"
+    "alarms",
+    "declarativeNetRequest"
   ],
   "host_permissions": [
-    "https://www.advice.co.th/*"
+    "https://www.advice.co.th/*",
+    "https://img.advice.co.th/*",
+    "http://localhost:*/*",
+    "https://kweelamin.com/*",
+    "https://www.kweelamin.com/*"
   ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "cors_rules",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  },
   "action": {
     "default_popup": "popup.html",
     "default_title": "Advice.co.th Scraper",

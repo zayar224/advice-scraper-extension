@@ -9,5 +9,18 @@
   </head>
   <body>
     <div id="root"></div>
+    <div id="kweelamin-section" style="margin-top:12px;padding:12px;border-top:2px solid #f59e0b;">
+      <div style="font-size:12px;font-weight:bold;color:#f59e0b;margin-bottom:8px;">Kweelamin Upload</div>
+      <div style="display:flex;gap:6px;margin-bottom:6px;">
+        <input id="kweelamin-url" type="text" placeholder="Server URL (e.g. http://localhost:3000)"
+          style="flex:1;padding:6px 8px;border:1px solid #374151;border-radius:6px;background:#1f2937;color:#e5e7eb;font-size:11px;" />
+      </div>
+      <button id="kweelamin-send" disabled
+        style="width:100%;padding:8px;background:#f59e0b;color:#000;border:none;border-radius:6px;font-weight:bold;font-size:12px;cursor:pointer;opacity:0.5;">
+        Send to Kweelamin
+      </button>
+      <div id="kweelamin-status" style="margin-top:6px;font-size:11px;color:#9ca3af;"></div>
+    </div>
+    <script src="popup-kweelamin.js"></script>
   </body>
 </html>

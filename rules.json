@@ -1,0 +1,18 @@
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "responseHeaders": [
+        { "header": "Access-Control-Allow-Origin", "operation": "set", "value": "https://www.advice.co.th" },
+        { "header": "Access-Control-Allow-Methods", "operation": "set", "value": "GET" },
+        { "header": "Access-Control-Allow-Credentials", "operation": "set", "value": "true" }
+      ]
+    },
+    "condition": {
+      "urlFilter": "||img.advice.co.th",
+      "resourceTypes": ["image", "xmlhttprequest"]
+    }
+  }
+]

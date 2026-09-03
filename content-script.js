@@ -49,9 +49,9 @@ if (window._adviceScraperLoaded) {
       const bahtRe = /฿\s*([\d,]+)/g;
       let m;
       while ((m = bahtRe.exec(normalized)) !== null) {
-        const before = normalized.slice(Math.max(0, m.index - 2), m.index);
-        // Skip the discount line (-฿1,500 style)
-        if (before.includes("-") || before.includes("−")) continue;
+        const before = normalized.slice(Math.max(0, m.index - 10), m.index);
+        // Skip the discount line (-฿1,500 style, including "- ฿4,000" with whitespace)
+        if (/\s*-\s*$/.test(before) || /\s*−\s*$/.test(before)) continue;
         matches.push(m[1]); // just the number part
       }
       console.log("[extractPrice] matches found:", matches);
@@ -801,8 +801,8 @@ if (window._adviceScraperLoaded) {
           const cleanForOriginal = [];
           for (const tok of allPriceMatches) {
             const idx = normalizedText.indexOf(tok);
-            const before = normalizedText.slice(Math.max(0, idx - 2), idx);
-            if (before.includes("-") || before.includes("−")) continue;
+            const before = normalizedText.slice(Math.max(0, idx - 10), idx);
+            if (/\s*-\s*$/.test(before) || /\s*−\s*$/.test(before)) continue;
             cleanForOriginal.push(tok);
           }
           if (cleanForOriginal.length >= 2) {
@@ -1212,7 +1212,7 @@ if (window._adviceScraperLoaded) {
           (el) => {
             const t = safeTextOf(el);
             return (
-              /Online Price Only|ราคานี้เฉพาะออนไลน์|Retail Price|ราคาปกติ/i.test(
+              /Online Price Only|Online Only|ราคานี้เฉพาะออนไลน์|Retail Price|ราคาปกติ|ราคาเริ่มต้น/i.test(
                 t,
               ) && t.length < 80
             );
@@ -1242,7 +1242,7 @@ if (window._adviceScraperLoaded) {
 
           if (!ep) return;
           const t = safeTextOf(label);
-          if (/Retail|ราคาปกติ/i.test(t) && !seen.has("retail")) {
+          if (/Retail|ราคาปกติ|ราคาเริ่มต้น/i.test(t) && !seen.has("retail")) {
             out.originalPrice = ep.str;
             out.originalPriceValue = ep.val;
             seen.add("retail");
@@ -1269,10 +1269,10 @@ if (window._adviceScraperLoaded) {
           for (const tok of allMatches) {
             const idx = (document.body.textContent || "").indexOf(tok);
             const before = (document.body.textContent || "").slice(
-              Math.max(0, idx - 3),
+              Math.max(0, idx - 10),
               idx,
             );
-            if (before.includes("-") || before.includes("−")) continue;
+            if (/\s*-\s*$/.test(before) || /\s*−\s*$/.test(before)) continue;
             clean.push(tok);
           }
           if (clean.length >= 2) {
@@ -1317,6 +1317,7 @@ if (window._adviceScraperLoaded) {
         // Online only.
         out.isOnlineOnly =
           (document.body.textContent || "").includes("Online Price Only") ||
+          (document.body.textContent || "").includes("Online Only") ||
           (document.body.textContent || "").includes("ราคานี้เฉพาะออนไลน์");
 
         // Images.
@@ -1508,10 +1509,36 @@ if (window._adviceScraperLoaded) {
         });
         return true;
       }
-      if (msg.action === "scrollToLoad") {
-        loadAllProducts()
-          .then(() => callback({ scrolled: true }))
-          .catch(() => callback({ scrolled: false }));
+      if (msg.action === "fetchImages") {
+        // Fetch images from img.advice.co.th (CORS headers added by declarativeNetRequest)
+        (async () => {
+          const results = [];
+          for (const item of msg.items || []) {
+            const base64Images = [];
+            const urls = item.urls || [];
+            for (let i = 0; i < urls.length && i < 5; i++) {
+              const url = urls[i];
+              if (!url || !url.startsWith("http")) continue;
+              try {
+                const res = await fetch(url, { credentials: "include" });
+                if (!res.ok) continue;
+                const blob = await res.blob();
+                if (blob.size > 5 * 1024 * 1024) continue;
+                const b64 = await new Promise((resolve, reject) => {
+                  const reader = new FileReader();
+                  reader.onloadend = () => resolve(reader.result);
+                  reader.onerror = reject;
+                  reader.readAsDataURL(blob);
+                });
+                base64Images.push(b64);
+              } catch (e) {
+                console.warn("[Kweelamin] Image fetch failed:", url.slice(0, 60), e.message);
+              }
+            }
+            results.push({ name: item.name, base64Images });
+          }
+          callback({ success: true, results });
+        })();
         return true;
       }
       if (msg.action === "enrichProgress") {
@@ -1778,7 +1805,7 @@ if (window._adviceScraperLoaded) {
           (el) => {
             const t = _safeTextOf(el);
             return (
-              /Online Price Only|ราคานี้เฉพาะออนไลน์|Retail Price|ราคาปกติ/i.test(
+              /Online Price Only|Online Only|ราคานี้เฉพาะออนไลน์|Retail Price|ราคาปกติ|ราคาเริ่มต้น/i.test(
                 t,
               ) && t.length < 100
             );
@@ -1804,7 +1831,7 @@ if (window._adviceScraperLoaded) {
           if (!ep) ep = _extractPrice(_safeTextOf(label));
 
           const t = _safeTextOf(label);
-          if (/Retail|ราคาปกติ/i.test(t) && !seen.has("retail")) {
+          if (/Retail|ราคาปกติ|ราคาเริ่มต้น/i.test(t) && !seen.has("retail")) {
             out.originalPrice = ep.str;
             out.originalPriceValue = ep.val;
             seen.add("retail");
@@ -1828,10 +1855,10 @@ if (window._adviceScraperLoaded) {
           const clean = allM.filter((tok) => {
             const idx = (doc.body.textContent || "").indexOf(tok);
             const before = (doc.body.textContent || "").slice(
-              Math.max(0, idx - 3),
+              Math.max(0, idx - 10),
               idx,
             );
-            return !before.includes("-") && !before.includes("−");
+            return !/\s*-\s*$/.test(before) && !/\s*−\s*$/.test(before);
           });
           if (clean.length >= 2) {
             out.originalPrice = clean[0];
@@ -1868,6 +1895,7 @@ if (window._adviceScraperLoaded) {
         // Online only
         out.isOnlineOnly =
           (doc.body.textContent || "").includes("Online Price Only") ||
+          (doc.body.textContent || "").includes("Online Only") ||
           (doc.body.textContent || "").includes("ราคานี้เฉพาะออนไลน์");
 
         // Images — gallery
@@ -2076,8 +2104,8 @@ if (window._adviceScraperLoaded) {
       }
       let m;
       while ((m = re.exec(normalized)) !== null) {
-        const before = normalized.slice(Math.max(0, m.index - 2), m.index);
-        if (before.includes("-") || before.includes("−")) continue;
+        const before = normalized.slice(Math.max(0, m.index - 10), m.index);
+        if (/\s*-\s*$/.test(before) || /\s*−\s*$/.test(before)) continue;
         matches.push(m[1]);
       }
       if (matches.length === 0) return null;
