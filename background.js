@@ -404,24 +404,41 @@ async function sendToKweelamin(serverUrl) {
     images: p.images || (p.imageUrl ? [p.imageUrl] : []),
   }));
 
-  let uploadResult;
-  try {
-    const response = await fetch(`${serverUrl}/api/advice-extension-upload`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ products: metadataProducts, skipImages: true }),
-    });
-    uploadResult = await response.json();
-    console.log("[Kweelamin] Upload result:", uploadResult);
-    if (!response.ok) {
-      setProgress("Error: " + (uploadResult.error || "Upload failed"), 0);
-      return { success: false, error: uploadResult.error || "Upload failed" };
+  // Upload in chunks of 30 to avoid NGINX body size limits (default 1MB)
+  const UPLOAD_CHUNK = 30;
+  let totalSynced = 0;
+  let totalSkipped = 0;
+
+  for (let i = 0; i < metadataProducts.length; i += UPLOAD_CHUNK) {
+    const chunk = metadataProducts.slice(i, i + UPLOAD_CHUNK);
+    setProgress(`Uploading products ${i + 1}-${Math.min(i + UPLOAD_CHUNK, metadataProducts.length)} of ${metadataProducts.length}...`, 10);
+
+    try {
+      const response = await fetch(`${serverUrl}/api/advice-extension-upload`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ products: chunk, skipImages: true }),
+      });
+      const text = await response.text();
+      let result;
+      try { result = JSON.parse(text); } catch { result = null; }
+      console.log("[Kweelamin] Chunk upload result:", result);
+      if (!response.ok || !result) {
+        const errMsg = result?.error || `Server returned ${response.status}: ${text.slice(0, 200)}`;
+        console.error("[Kweelamin] Chunk upload failed:", errMsg);
+        setProgress("Error: " + errMsg, 0);
+        return { success: false, error: errMsg };
+      }
+      totalSynced += result.synced || 0;
+      totalSkipped += result.skipped || 0;
+    } catch (e) {
+      console.error("[Kweelamin] Upload failed:", e);
+      setProgress("Error: " + e.message, 0);
+      return { success: false, error: "Failed to connect: " + e.message };
     }
-  } catch (e) {
-    console.error("[Kweelamin] Upload failed:", e);
-    setProgress("Error: " + e.message, 0);
-    return { success: false, error: "Failed to connect: " + e.message };
   }
+
+  const uploadResult = { success: true, synced: totalSynced, skipped: totalSkipped };
 
   // Step 2: Fetch images via content script on advice.co.th tab
   let imagesUploaded = 0;
@@ -499,7 +516,9 @@ async function sendToKweelamin(serverUrl) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ apply: true }),
       });
-      const applyResult = await applyResponse.json();
+      const applyText = await applyResponse.text();
+      let applyResult;
+      try { applyResult = JSON.parse(applyText); } catch { applyResult = null; }
       console.log("[Kweelamin] Apply result:", applyResult);
     } catch (e) {
       console.warn("[Kweelamin] Apply failed:", e.message);
