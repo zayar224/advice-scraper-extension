@@ -76,6 +76,15 @@ if (window._adviceScraperLoaded) {
     }
 
     // ─── Text cleaning utilities ─────────────────────────────────────────────
+    function normalizeImgSrc(src) {
+      if (!src) return "";
+      // Cloudflare image transform URLs: the actual image path follows the
+      // transform params (e.g. /cdn-cgi/image/format=auto,width=700/https://...).
+      // Splitting on "?" would destroy the path — keep the full URL.
+      if (src.includes("/cdn-cgi/image/")) return src;
+      // Regular URLs: strip query params for dedup.
+      return src.split("?")[0];
+    }
     function stripThai(text) {
       if (!text) return "";
       return text
@@ -560,16 +569,55 @@ if (window._adviceScraperLoaded) {
       return document.querySelectorAll(PRODUCT_LINK_SEL).length;
     }
 
-    async function loadAllProducts(maxRounds = 20, delayMs = 1500) {
-      let prev = -1;
-      for (let i = 0; i < maxRounds; i++) {
-        const cur = getProductLinkCount();
-        if (cur === prev && cur > 0) break;
-        prev = cur;
-        window.scrollTo(0, document.body.scrollHeight);
-        await new Promise((r) => setTimeout(r, delayMs));
+    async function loadAllProducts(maxRounds = 40, delayMs = 1200) {
+      function getShowMoreBtn() {
+        return (
+          document.querySelector("button.showproduct-more") ||
+          document.querySelector('[class*="showproduct-more"]') ||
+          document.querySelector('button[class*="load-more"]') ||
+          document.querySelector('button[class*="loadMore"]')
+        );
       }
-      // Scroll back to top so the user sees the scraped cards.
+      function isLoading() {
+        return !!document.querySelector('img.loading-cate, [class*="loading-cate"]');
+      }
+      async function waitForLoad(timeoutMs = 5000) {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+          if (!isLoading()) return;
+          await new Promise((r) => setTimeout(r, 200));
+        }
+      }
+      let prev = -1;
+      let stableRounds = 0;
+      for (let i = 0; i < maxRounds; i++) {
+        // Click "show more" button if present (category-style expanders).
+        const btn = getShowMoreBtn();
+        if (btn) {
+          try { btn.click(); } catch (_) {}
+          await new Promise((r) => setTimeout(r, 800));
+          await waitForLoad(4000);
+        }
+        // Incremental scroll: move halfway down first to trigger IntersectionObserver.
+        const midY = Math.floor(document.body.scrollHeight * 0.7);
+        window.scrollTo(0, midY);
+        await new Promise((r) => setTimeout(r, 400));
+        // Then scroll to bottom to hit the sentinel.
+        window.scrollTo(0, document.body.scrollHeight);
+        // Wait for any loading indicator to finish.
+        await waitForLoad(5000);
+        await new Promise((r) => setTimeout(r, delayMs));
+        const cur = getProductLinkCount();
+        if (cur === prev) {
+          stableRounds++;
+          // Require 3 stable rounds to confirm no more products are loading.
+          if (stableRounds >= 3 && cur > 0) break;
+        } else {
+          stableRounds = 0;
+        }
+        prev = cur;
+        console.log("[scraper] loadAllProducts round", i + 1, "links:", cur);
+      }
       window.scrollTo(0, 0);
       await new Promise((r) => setTimeout(r, 300));
     }
@@ -905,8 +953,7 @@ if (window._adviceScraperLoaded) {
           img.getAttribute("data-large") ||
           "";
         if (!src) return;
-        // Strip query params for dedup, keep high-res if present.
-        src = src.split("?")[0];
+        src = normalizeImgSrc(src);
         if (!src.startsWith("http")) return;
         if (seen.has(src)) return;
         seen.add(src);
@@ -1171,7 +1218,9 @@ if (window._adviceScraperLoaded) {
         const seen = new Set();
 
         // First, try specific classes for retail price (originalPrice)
+        // Actual site uses .product-price.normal > .item-price for retail.
         const retailPriceSelectors = [
+          ".product-price.normal .item-price",
           ".product-price-srp .item-price",
           ".item-price-srp del",
           '[class*="price-srp"]',
@@ -1190,8 +1239,11 @@ if (window._adviceScraperLoaded) {
         }
 
         // Then try for online price
+        // Actual site uses .product-price-save > .product-price > .item-price for online-only.
         const onlinePriceSelectors = [
+          ".product-price-save .item-price",
           ".product-price-online .item-price",
+          ".d-add-cart-2 .d-add-cart-item-price",
           '[class*="price-online"]',
         ];
         for (const sel of onlinePriceSelectors) {
@@ -1208,23 +1260,33 @@ if (window._adviceScraperLoaded) {
         }
 
         // Then try label-based approach as fallback
-        const priceLabels = Array.from(document.querySelectorAll("*")).filter(
-          (el) => {
-            const t = safeTextOf(el);
-            return (
-              /Online Price Only|Online Only|ราคานี้เฉพาะออนไลน์|Retail Price|ราคาปกติ|ราคาเริ่มต้น/i.test(
-                t,
-              ) && t.length < 80
-            );
-          },
-        );
+        const priceLabels = Array.from(
+          document.querySelectorAll(".item-text, .product-price, span, div"),
+        ).filter((el) => {
+          const t = safeTextOf(el);
+          return (
+            t.length < 60 &&
+            (/ราคาเฉพาะออนไลน์|ราคาปกติ|Online Price Only|Online Only|Retail Price/i.test(
+              t,
+            ))
+          );
+        });
         priceLabels.forEach((label) => {
           // Look for price in siblings/children of the label
-          let priceEl = label.nextElementSibling;
           let ep = null;
-          // Check next sibling first
-          if (priceEl) ep = extractPrice(safeTextOf(priceEl));
-          // If not found, check parent's children
+          // Check the label's own parent row for the price element.
+          const row = label.closest(".product-price") || label.parentElement;
+          if (row) {
+            const priceEl = row.querySelector(
+              ".item-price, .d-add-cart-item-price, [class*='price']",
+            );
+            if (priceEl) ep = extractPrice(safeTextOf(priceEl));
+          }
+          // Check next sibling
+          if (!ep && label.nextElementSibling) {
+            ep = extractPrice(safeTextOf(label.nextElementSibling));
+          }
+          // If still not found, check parent's children
           if (!ep && label.parentElement) {
             const siblings = Array.from(label.parentElement.children);
             for (const sib of siblings) {
@@ -1237,51 +1299,110 @@ if (window._adviceScraperLoaded) {
               }
             }
           }
-          // If still not found, check label's own text (fallback)
           if (!ep) ep = extractPrice(safeTextOf(label));
-
           if (!ep) return;
           const t = safeTextOf(label);
-          if (/Retail|ราคาปกติ|ราคาเริ่มต้น/i.test(t) && !seen.has("retail")) {
+          if (/ราคาปกติ|ราคาเริ่มต้น|Retail/i.test(t) && !seen.has("retail")) {
             out.originalPrice = ep.str;
             out.originalPriceValue = ep.val;
             seen.add("retail");
-          } else if (/Online|ออนไลน์/i.test(t) && !seen.has("online")) {
+          } else if (/ออนไลน์|Online/i.test(t) && !seen.has("online")) {
             out.price = ep.str;
             out.priceValue = ep.val;
             seen.add("online");
           }
         });
 
-        // Fallback to whole-page scan if structured extraction missed.
+        // Fallback to structured extraction if label-based missed.
         if (!out.priceValue) {
-          const ep = extractPrice(document.body.textContent || "");
-          if (ep) {
-            out.price = ep.str;
-            out.priceValue = ep.val;
+          // Try JSON-LD structured data first (most reliable).
+          try {
+            const ldScripts = document.querySelectorAll(
+              'script[type="application/ld+json"]',
+            );
+            for (const s of ldScripts) {
+              const ld = JSON.parse(s.textContent || "{}");
+              const offers = ld.offers || ld;
+              const p =
+                offers.price ||
+                offers.lowPrice ||
+                (Array.isArray(offers) ? offers[0]?.price : null);
+              if (p) {
+                const num = parseInt(String(p).replace(/[^\d]/g, ""), 10);
+                if (num > 0) {
+                  out.price = "฿" + num.toLocaleString();
+                  out.priceValue = num;
+                  break;
+                }
+              }
+            }
+          } catch (_) {}
+        }
+        if (!out.priceValue) {
+          // Try the main visible price element.
+          const mainPrice = document.querySelector(
+            ".item-price, .d-add-cart-item-price",
+          );
+          if (mainPrice) {
+            const ep = extractPrice(safeTextOf(mainPrice));
+            if (ep) {
+              out.price = ep.str;
+              out.priceValue = ep.val;
+            }
+          }
+        }
+        if (!out.priceValue) {
+          // Last resort: scan all ฿ amounts, pick the most common one.
+          const allM = (document.body.textContent || "").match(/฿[\d,]+/g) || [];
+          if (allM.length > 0) {
+            // The product price is usually the most frequent ฿ amount.
+            const freq = {};
+            for (const tok of allM) {
+              freq[tok] = (freq[tok] || 0) + 1;
+            }
+            const best = Object.entries(freq).sort(
+              (a, b) => b[1] - a[1],
+            )[0][0];
+            out.price = best;
+            out.priceValue = U(best);
           }
         }
         if (!out.originalPriceValue) {
-          // Also get original price if there are at least 2 clean prices.
-          const allMatches =
-            (document.body.textContent || "").match(/฿[\d,]+/g) || [];
-          const clean = [];
-          for (const tok of allMatches) {
-            const idx = (document.body.textContent || "").indexOf(tok);
-            const before = (document.body.textContent || "").slice(
-              Math.max(0, idx - 10),
-              idx,
+          // Try JSON-LD retail price.
+          try {
+            const ldScripts = document.querySelectorAll(
+              'script[type="application/ld+json"]',
             );
-            if (/\s*-\s*$/.test(before) || /\s*−\s*$/.test(before)) continue;
-            clean.push(tok);
-          }
-          if (clean.length >= 2) {
-            // The second price is usually the current price, first is original?
-            // Wait, let's check: if we have clean[0] and clean[1], which is which?
-            // Typically, original price is first if it's struck through, but let's just take the first one as original if we don't have it yet
-            if (!out.originalPriceValue) {
-              out.originalPrice = clean[0];
-              out.originalPriceValue = U(clean[0]);
+            for (const s of ldScripts) {
+              const ld = JSON.parse(s.textContent || "{}");
+              const offers = ld.offers || ld;
+              const listPrice =
+                offers.highPrice ||
+                (Array.isArray(offers) ? offers[0]?.highPrice : null);
+              if (listPrice) {
+                const num = parseInt(
+                  String(listPrice).replace(/[^\d]/g, ""),
+                  10,
+                );
+                if (num > 0) {
+                  out.originalPrice = "฿" + num.toLocaleString();
+                  out.originalPriceValue = num;
+                  break;
+                }
+              }
+            }
+          } catch (_) {}
+        }
+        if (!out.originalPriceValue) {
+          // Look for struck-through retail price in .product-price.normal.
+          const retailEl = document.querySelector(
+            ".product-price.normal .item-price, .item-price del",
+          );
+          if (retailEl) {
+            const ep = extractPrice(safeTextOf(retailEl));
+            if (ep) {
+              out.originalPrice = ep.str;
+              out.originalPriceValue = ep.val;
             }
           }
         }
@@ -1519,20 +1640,40 @@ if (window._adviceScraperLoaded) {
             for (let i = 0; i < urls.length && i < 5; i++) {
               const url = urls[i];
               if (!url || !url.startsWith("http")) continue;
-              try {
-                const res = await fetch(url, { credentials: "include" });
-                if (!res.ok) continue;
-                const blob = await res.blob();
-                if (blob.size > 5 * 1024 * 1024) continue;
-                const b64 = await new Promise((resolve, reject) => {
-                  const reader = new FileReader();
-                  reader.onloadend = () => resolve(reader.result);
-                  reader.onerror = reject;
-                  reader.readAsDataURL(blob);
-                });
-                base64Images.push(b64);
-              } catch (e) {
-                console.warn("[Kweelamin] Image fetch failed:", url.slice(0, 60), e.message);
+              // Build candidate URLs: full URL first, then Cloudflare-stripped fallback.
+              const candidates = [url];
+              const cfMatch = url.match(
+                /\/cdn-cgi\/image\/[^/]+\/(https?:\/\/.*)/,
+              );
+              if (cfMatch && cfMatch[1] !== url) {
+                candidates.push(cfMatch[1]);
+              }
+              for (const candidate of candidates) {
+                try {
+                  const res = await fetch(candidate, {
+                    credentials: "include",
+                  });
+                  if (!res.ok) continue;
+                  const blob = await res.blob();
+                  if (blob.size === 0 || blob.size > 5 * 1024 * 1024)
+                    continue;
+                  // Verify it's actually an image.
+                  if (!blob.type.startsWith("image/")) continue;
+                  const b64 = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onloadend = () => resolve(reader.result);
+                    reader.onerror = reject;
+                    reader.readAsDataURL(blob);
+                  });
+                  base64Images.push(b64);
+                  break; // Got a valid image, move to next URL.
+                } catch (e) {
+                  console.warn(
+                    "[Kweelamin] Image fetch failed:",
+                    candidate.slice(0, 80),
+                    e.message,
+                  );
+                }
               }
             }
             results.push({ name: item.name, base64Images });
@@ -1583,10 +1724,11 @@ if (window._adviceScraperLoaded) {
       results: [], // enriched products so far
       total: 0,
       done: 0,
-      concurrency: 6, // parallel iframes (balanced against Cloudflare)
+      concurrency: 3, // parallel iframes (lower to avoid Cloudflare throttling)
       running: 0,
       onProgress: null, // callback(done, total, currentProduct)
       abort: false,
+      retryCount: 0, // how many retry passes have been done
     };
 
     function _enrichTick() {
@@ -1601,6 +1743,34 @@ if (window._adviceScraperLoaded) {
         _openDetailIframe(product);
       }
       if (_enr.running === 0 && _enr.queue.length === 0) {
+        // Retry failed products up to 2 times with a delay between passes.
+        const failed = _enr.results.filter((r) => r.detailFetched === false);
+        if (failed.length > 0 && _enr.retryCount < 2) {
+          _enr.retryCount++;
+          console.log(
+            "[enrich] retrying",
+            failed.length,
+            "failed products (pass",
+            _enr.retryCount,
+            ")",
+          );
+          // Wait 5s between retry passes to let Cloudflare cool down.
+          setTimeout(() => {
+            // Remove failed results so they get re-processed.
+            _enr.results = _enr.results.filter(
+              (r) => r.detailFetched !== false,
+            );
+            _enr.queue = failed.map((r) => ({
+              url: r.url,
+              name: r.name,
+              brand: r.brand,
+            }));
+            _enr.done = _enr.results.length;
+            _enr.total = _enr.results.length + _enr.queue.length;
+            _enrichTick();
+          }, 5000);
+          return;
+        }
         console.log("[enrich] all done, notifying background");
         _enr.onProgress && _enr.onProgress(_enr.total, _enr.total, null);
         _notifyBackgroundEnrichDone(_enr.results);
@@ -1627,12 +1797,11 @@ if (window._adviceScraperLoaded) {
         _enr.done++;
         _enr.onProgress && _enr.onProgress(_enr.done, _enr.total, product.url);
         _enrichTick();
-      }, 20000); // 20s per iframe
+      }, 30000); // 30s per iframe (Cloudflare + Nuxt hydration can be slow)
 
       iframe.onload = iframe.onerror = () => {
         if (settled) return;
         clearTimeout(timer);
-        settled = true;
         const win = iframe.contentWindow;
         let childCount = 0;
         try {
@@ -1649,38 +1818,65 @@ if (window._adviceScraperLoaded) {
           "childNodes:",
           childCount,
         );
-        try {
-          if (win && win.document && win.document.body && childCount > 5) {
-            // Only parse if the page actually loaded content (body has real children).
-            const detail = _kDetailFromWindow(win, product.url);
-            if (detail.success !== false) {
-              _enr.results.push({ ...product, ...detail, detailFetched: true });
+        // Nuxt SSR sends skeleton HTML — wait for client hydration to render
+        // the real product content before parsing DOM-based selectors.
+        const _parseAfterHydration = () => {
+          if (settled) return;
+          settled = true;
+          try {
+            if (win && win.document && win.document.body && childCount > 5) {
+              const detail = _kDetailFromWindow(win, product.url);
+              if (detail.success !== false) {
+                _enr.results.push({ ...product, ...detail, detailFetched: true });
+              } else {
+                _enr.results.push({
+                  ...product,
+                  detailFetched: false,
+                  detailError: detail.error || "parse failed",
+                });
+              }
             } else {
               _enr.results.push({
                 ...product,
                 detailFetched: false,
-                detailError: detail.error || "parse failed",
+                detailError: "empty/Challenge page",
               });
             }
-          } else {
+          } catch (e) {
             _enr.results.push({
               ...product,
               detailFetched: false,
-              detailError: "empty/Challenge page",
+              detailError: String(e),
             });
           }
-        } catch (e) {
-          _enr.results.push({
-            ...product,
-            detailFetched: false,
-            detailError: String(e),
-          });
-        }
-        iframe.remove();
-        _enr.running--;
-        _enr.done++;
-        _enr.onProgress && _enr.onProgress(_enr.done, _enr.total, product.url);
-        _enrichTick();
+          iframe.remove();
+          _enr.running--;
+          _enr.done++;
+          _enr.onProgress && _enr.onProgress(_enr.done, _enr.total, product.url);
+          _enrichTick();
+        };
+        // Wait up to 4s for .item-price to appear (Nuxt hydration), then parse.
+        let waited = 0;
+        const _pollHydration = () => {
+          if (settled) return;
+          try {
+            if (
+              win.document.querySelector(
+                ".item-price, .product-price, h1, [class*='product']",
+              )
+            ) {
+              _parseAfterHydration();
+              return;
+            }
+          } catch (_) {}
+          waited += 400;
+          if (waited >= 4000) {
+            _parseAfterHydration();
+            return;
+          }
+          setTimeout(_pollHydration, 400);
+        };
+        _pollHydration();
       };
     }
 
@@ -1764,7 +1960,9 @@ if (window._adviceScraperLoaded) {
         const seen = new Set();
 
         // First, try specific classes for retail price (originalPrice)
+        // Actual site uses .product-price.normal > .item-price for retail.
         const retailPriceSelectors = [
+          ".product-price.normal .item-price",
           ".product-price-srp .item-price",
           ".item-price-srp del",
           '[class*="price-srp"]',
@@ -1783,8 +1981,11 @@ if (window._adviceScraperLoaded) {
         }
 
         // Then try for online price
+        // Actual site uses .product-price-save > .product-price > .item-price for online-only.
         const onlinePriceSelectors = [
+          ".product-price-save .item-price",
           ".product-price-online .item-price",
+          ".d-add-cart-2 .d-add-cart-item-price",
           '[class*="price-online"]',
         ];
         for (const sel of onlinePriceSelectors) {
@@ -1801,21 +2002,29 @@ if (window._adviceScraperLoaded) {
         }
 
         // Then try label-based approach as fallback
-        const priceLabels = Array.from(doc.querySelectorAll("*")).filter(
-          (el) => {
-            const t = _safeTextOf(el);
-            return (
-              /Online Price Only|Online Only|ราคานี้เฉพาะออนไลน์|Retail Price|ราคาปกติ|ราคาเริ่มต้น/i.test(
-                t,
-              ) && t.length < 100
-            );
-          },
-        );
+        const priceLabels = Array.from(
+          doc.querySelectorAll(".item-text, .product-price, span, div"),
+        ).filter((el) => {
+          const t = _safeTextOf(el);
+          return (
+            t.length < 60 &&
+            (/ราคาเฉพาะออนไลน์|ราคาปกติ|Online Price Only|Online Only|Retail Price/i.test(
+              t,
+            ))
+          );
+        });
         priceLabels.forEach((label) => {
-          // Look for price in siblings/children of the label
-          let priceEl = label.nextElementSibling;
           let ep = null;
-          if (priceEl) ep = _extractPrice(_safeTextOf(priceEl));
+          const row = label.closest(".product-price") || label.parentElement;
+          if (row) {
+            const priceEl = row.querySelector(
+              ".item-price, .d-add-cart-item-price, [class*='price']",
+            );
+            if (priceEl) ep = _extractPrice(_safeTextOf(priceEl));
+          }
+          if (!ep && label.nextElementSibling) {
+            ep = _extractPrice(_safeTextOf(label.nextElementSibling));
+          }
           if (!ep && label.parentElement) {
             const siblings = Array.from(label.parentElement.children);
             for (const sib of siblings) {
@@ -1829,40 +2038,104 @@ if (window._adviceScraperLoaded) {
             }
           }
           if (!ep) ep = _extractPrice(_safeTextOf(label));
-
+          if (!ep) return;
           const t = _safeTextOf(label);
-          if (/Retail|ราคาปกติ|ราคาเริ่มต้น/i.test(t) && !seen.has("retail")) {
+          if (/ราคาปกติ|ราคาเริ่มต้น|Retail/i.test(t) && !seen.has("retail")) {
             out.originalPrice = ep.str;
             out.originalPriceValue = ep.val;
             seen.add("retail");
-          } else if (/Online|ออนไลน์/i.test(t) && !seen.has("online")) {
+          } else if (/ออนไลน์|Online/i.test(t) && !seen.has("online")) {
             out.price = ep.str;
             out.priceValue = ep.val;
             seen.add("online");
           }
         });
 
-        // Fallback: whole-page scan
+        // Fallback: structured extraction if label-based missed.
         if (!out.priceValue) {
-          const ep = _extractPrice(doc.body.textContent || "");
-          if (ep) {
-            out.price = ep.str;
-            out.priceValue = ep.val;
+          // Try JSON-LD structured data first.
+          try {
+            const ldScripts = doc.querySelectorAll(
+              'script[type="application/ld+json"]',
+            );
+            for (const s of ldScripts) {
+              const ld = JSON.parse(s.textContent || "{}");
+              const offers = ld.offers || ld;
+              const p =
+                offers.price ||
+                offers.lowPrice ||
+                (Array.isArray(offers) ? offers[0]?.price : null);
+              if (p) {
+                const num = parseInt(String(p).replace(/[^\d]/g, ""), 10);
+                if (num > 0) {
+                  out.price = "฿" + num.toLocaleString();
+                  out.priceValue = num;
+                  break;
+                }
+              }
+            }
+          } catch (_) {}
+        }
+        if (!out.priceValue) {
+          // Try the main visible price element.
+          const mainPrice = doc.querySelector(
+            ".item-price, .d-add-cart-item-price",
+          );
+          if (mainPrice) {
+            const ep = _extractPrice(_safeTextOf(mainPrice));
+            if (ep) {
+              out.price = ep.str;
+              out.priceValue = ep.val;
+            }
+          }
+        }
+        if (!out.priceValue) {
+          // Last resort: scan all ฿ amounts, pick the most common one.
+          const allM = (doc.body.textContent || "").match(/฿[\d,]+/g) || [];
+          if (allM.length > 0) {
+            const freq = {};
+            for (const tok of allM) {
+              freq[tok] = (freq[tok] || 0) + 1;
+            }
+            const best = Object.entries(freq).sort((a, b) => b[1] - a[1])[0][0];
+            out.price = best;
+            out.priceValue = _U(best);
           }
         }
         if (!out.originalPriceValue) {
-          const allM = (doc.body.textContent || "").match(/฿[\d,]+/g) || [];
-          const clean = allM.filter((tok) => {
-            const idx = (doc.body.textContent || "").indexOf(tok);
-            const before = (doc.body.textContent || "").slice(
-              Math.max(0, idx - 10),
-              idx,
+          // Try JSON-LD retail price.
+          try {
+            const ldScripts = doc.querySelectorAll(
+              'script[type="application/ld+json"]',
             );
-            return !/\s*-\s*$/.test(before) && !/\s*−\s*$/.test(before);
-          });
-          if (clean.length >= 2) {
-            out.originalPrice = clean[0];
-            out.originalPriceValue = _U(clean[0]);
+            for (const s of ldScripts) {
+              const ld = JSON.parse(s.textContent || "{}");
+              const offers = ld.offers || ld;
+              const listPrice =
+                offers.highPrice ||
+                (Array.isArray(offers) ? offers[0]?.highPrice : null);
+              if (listPrice) {
+                const num = parseInt(String(listPrice).replace(/[^\d]/g, ""), 10);
+                if (num > 0) {
+                  out.originalPrice = "฿" + num.toLocaleString();
+                  out.originalPriceValue = num;
+                  break;
+                }
+              }
+            }
+          } catch (_) {}
+        }
+        if (!out.originalPriceValue) {
+          // Look for struck-through retail price in .product-price.normal.
+          const retailEl = doc.querySelector(
+            ".product-price.normal .item-price, .item-price del",
+          );
+          if (retailEl) {
+            const ep = _extractPrice(_safeTextOf(retailEl));
+            if (ep) {
+              out.originalPrice = ep.str;
+              out.originalPriceValue = ep.val;
+            }
           }
         }
 
@@ -1914,7 +2187,7 @@ if (window._adviceScraperLoaded) {
               img.getAttribute("data-zoom-image") ||
               "";
             if (!src) return;
-            src = src.split("?")[0];
+            src = normalizeImgSrc(src);
             if (!src.startsWith("http") || seenImg.has(src)) return;
             seenImg.add(src);
             imgs.push(src);
@@ -2193,6 +2466,7 @@ if (window._adviceScraperLoaded) {
       _enr.done = 0;
       _enr.running = 0;
       _enr.abort = false;
+      _enr.retryCount = 0;
       _enr.onProgress = onProgress;
       _enrichTick();
     }
@@ -2231,10 +2505,19 @@ if (window._adviceScraperLoaded) {
         .get("lastScraped")
         .then((prev) => {
           const base = prev.lastScraped || {};
+          // Merge: keep listing data for products that weren't enriched (timeouts).
+          const enrichedMap = new Map((results || []).map((r) => [r.url, r]));
+          const merged = (base.products || []).map(
+            (p) => enrichedMap.get(p.url) || p,
+          );
+          // Add any enriched results not in base.
+          (results || []).forEach((r) => {
+            if (!merged.find((p) => p.url === r.url)) merged.push(r);
+          });
           chrome.storage.local.set({
             lastScraped: {
               ...base,
-              products: results,
+              products: merged,
               detailsFetchedAt: new Date().toISOString(),
               enrichmentDone: true,
             },
